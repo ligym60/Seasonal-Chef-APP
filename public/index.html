@@ -12,8 +12,13 @@
     <li>1 each yellow onion</li>
     <li>4 cup vegetable broth</li>
   </ul>
-  <button id="get-ingredients">Get ingredients on Instacart</button>
+
+  <button id="get-ingredients" hidden>Get ingredients on Instacart</button>
+  <button id="copy-list">Copy shopping list</button>
+  <button id="share-list" hidden>Share list</button>
+  <button id="print-list">Print list</button>
   <p id="status" role="status"></p>
+  <pre id="list" hidden></pre>
 
   <script>
     const recipe = {
@@ -26,26 +31,73 @@
         { name: 'vegetable broth', quantity: 4, unit: 'cup' },
       ],
     };
+
     // Demo only: a real app's backend holds the token and calls this service.
     let token = sessionStorage.getItem('apiToken') || prompt('API token (APP_API_TOKEN)');
     if (token) sessionStorage.setItem('apiToken', token);
-    const btn = document.getElementById('get-ingredients');
-    const status = document.getElementById('status');
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
+
+    const $ = (id) => document.getElementById(id);
+    const status = $('status');
+    const post = (path, body) => fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    }).then(async (res) => {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Request failed');
+      return data;
+    });
+
+    // Pantry-aware plain-text list; works without any Instacart access.
+    const getList = async () =>
+      (await post('/api/shopping-list/export', { title: recipe.title, items: recipe.ingredients })).text;
+
+    // Show the Instacart button only once the server has an API key.
+    fetch('/api/config', { headers: { Authorization: `Bearer ${token}` } })
+      .then((res) => res.json())
+      .then((config) => { $('get-ingredients').hidden = !config.instacartEnabled; })
+      .catch(() => {});
+
+    if (navigator.share) $('share-list').hidden = false;
+
+    $('get-ingredients').addEventListener('click', async (e) => {
+      e.target.disabled = true;
       status.textContent = 'Building your Instacart page...';
       try {
-        const res = await fetch('/api/instacart/recipe', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify(recipe),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.url) throw new Error(data.error || 'Request failed');
+        const data = await post('/api/instacart/recipe', recipe);
+        if (!data.url) throw new Error('Nothing to buy, your pantry covers everything');
         window.location.href = data.url;
-      } catch (e) {
-        status.textContent = 'Sorry, could not reach Instacart: ' + e.message;
-        btn.disabled = false;
+      } catch (err) {
+        status.textContent = 'Sorry, could not reach Instacart: ' + err.message;
+        e.target.disabled = false;
+      }
+    });
+
+    $('copy-list').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(await getList());
+        status.textContent = 'Shopping list copied.';
+      } catch (err) {
+        status.textContent = 'Could not copy the list: ' + err.message;
+      }
+    });
+
+    $('share-list').addEventListener('click', async () => {
+      try {
+        await navigator.share({ title: recipe.title, text: await getList() });
+      } catch (err) {
+        if (err.name !== 'AbortError') status.textContent = 'Could not share the list: ' + err.message;
+      }
+    });
+
+    $('print-list').addEventListener('click', async () => {
+      try {
+        const list = $('list');
+        list.textContent = await getList();
+        list.hidden = false;
+        window.print();
+      } catch (err) {
+        status.textContent = 'Could not print the list: ' + err.message;
       }
     });
   </script>

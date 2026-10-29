@@ -20,3 +20,9 @@ Healthy recipe provider
 - Rate limits per IP: 120 requests/minute on `/api`, and 20/minute on the Instacart endpoints. Set `TRUST_PROXY=1` behind nginx.
 - Ingredient names are cleaned before matching and pantry lookups ("2 cups flour, sifted" -> `flour`, with "flour, sifted" kept as display text),
   and repeated ingredients are merged when their units are comparable.
+
+## Without Instacart access
+
+Instacart isn't accepting new Developer Platform applications, so the app works without a key:
+- `POST /api/shopping-list/export` returns the pantry-aware list as a Markdown checklist (`text`), using the same `userId`/`keep` options.
+- `GET /api/config` returns `{ instacartEnabled }`; the demo page hides the Instacart button until `INSTACART_API_KEY` is set, and offers Copy / Share / Print in the meantime.

@@ -210,4 +210,28 @@ app.post('/api/instacart/shopping-list', (req, res) => {
   }, skipped);
 });
 
+// Lets clients hide the Instacart button until a key is configured.
+app.get('/api/config', (req, res) => res.json({ instacartEnabled: Boolean(INSTACART_API_KEY) }));
+
+const formatQuantity = ({ quantity, unit }) => {
+  const q = Number(quantity);
+  if (!(q > 0)) return '';
+  const n = Math.round(q * 100) / 100;
+  return unit && unit !== 'each' ? `${n} ${unit} ` : `${n} `;
+};
+
+// Plain-text shopping list that works with no partner API: the same pantry
+// handling as the Instacart endpoints, returned as a Markdown checklist.
+// Body: { userId?, keep?: string[], title?, items: [{ name, quantity?, unit?, displayText? }] }
+app.post('/api/shopping-list/export', (req, res) => {
+  const { userId, keep, title = 'Shopping list', items } = req.body ?? {};
+  if (!Array.isArray(items) || items.length === 0 || !items.every(isValidItem)) {
+    return res.status(400).json({ error: 'items must be a non-empty array of { name, quantity?, unit? }' });
+  }
+
+  const { needed, skipped } = subtractPantry(userId, normalizeItems(items), keep);
+  const lines = needed.map((i) => `- [ ] ${formatQuantity(i)}${i.displayText ?? i.name}`);
+  res.json({ needed, skipped, text: [`# ${title}`, ...lines].join('\n') });
+});
+
 app.listen(PORT, () => console.log(`Seasonal Chef listening on :${PORT}`));
