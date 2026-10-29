@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import express from 'express';
 
 const {
@@ -6,6 +7,11 @@ const {
   PARTNER_LINKBACK_URL = 'http://localhost:3000',
   PORT = 3000,
 } = process.env;
+
+// Instacart recipe links expire after 30 days by default; reuse them until
+// shortly before that, and only regenerate when the recipe changes.
+const CACHE_TTL_MS = 29 * 24 * 60 * 60 * 1000;
+const urlCache = new Map(); // payload hash -> { url, expiresAt }
 
 const app = express();
 app.use(express.json());
@@ -36,6 +42,12 @@ app.post('/api/instacart/recipe', async (req, res) => {
     landing_page_configuration: { partner_linkback_url: PARTNER_LINKBACK_URL },
   };
 
+  const cacheKey = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  const cached = urlCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return res.json({ url: cached.url, cached: true });
+  }
+
   try {
     const upstream = await fetch(`${INSTACART_BASE_URL}/idp/v1/products/recipe`, {
       method: 'POST',
@@ -50,6 +62,10 @@ app.post('/api/instacart/recipe', async (req, res) => {
     if (!upstream.ok) {
       return res.status(502).json({ error: 'Instacart request failed', status: upstream.status, details: data });
     }
+    if (!data.products_link_url) {
+      return res.status(502).json({ error: 'Instacart returned no link', details: data });
+    }
+    urlCache.set(cacheKey, { url: data.products_link_url, expiresAt: Date.now() + CACHE_TTL_MS });
     res.json({ url: data.products_link_url });
   } catch (err) {
     res.status(502).json({ error: 'Could not reach Instacart', details: String(err) });
