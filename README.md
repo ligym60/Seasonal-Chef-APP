@@ -26,3 +26,19 @@ Healthy recipe provider
 Instacart isn't accepting new Developer Platform applications, so the app works without a key:
 - `POST /api/shopping-list/export` returns the pantry-aware list as a Markdown checklist (`text`), using the same `userId`/`keep` options.
 - `GET /api/config` returns `{ instacartEnabled }`; the demo page hides the Instacart button until `INSTACART_API_KEY` is set, and offers Copy / Share / Print in the meantime.
+
+## Kroger
+
+Uses Kroger's Public APIs (Authorization, Locations, Products, Cart). Set `KROGER_CLIENT_ID`, `KROGER_CLIENT_SECRET`
+and `KROGER_REDIRECT_URI` (must match a redirect URL registered on the Kroger app, pointing at `/kroger/callback`).
+
+1. `POST /api/kroger/stores` `{ zipCode }` lists nearby stores; the shopper picks one (`locationId`).
+2. `POST /api/kroger/connect` `{ userId }` returns a Kroger sign-in URL. After approval Kroger redirects to
+   `/kroger/callback`, which stores the shopper's tokens (file mode 600) and sends them to `PARTNER_LINKBACK_URL`.
+   `GET /api/kroger/status/:userId` says whether they're connected.
+3. `POST /api/kroger/cart` `{ userId, locationId, modality?, keep?, preview?, items }` subtracts the pantry, matches each
+   ingredient to an in-stock product at that store, and adds them to the shopper's cart. Use `preview: true` to see matches first.
+   Checkout happens in Kroger's app or site.
+
+Kroger carts hold whole product units, so "2 cups milk" becomes 1 milk; only `each` quantities use the count.
+Matching is a text search, so show the `preview` to the user. Public API limits: 10,000 product, 1,600 location and 5,000 cart calls per day.

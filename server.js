@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
+import { createKroger } from './lib/kroger.js';
 import { cleanName, mergeDuplicates } from './lib/names.js';
 import { createPantry } from './lib/pantry.js';
 import { measurementsFor, normalizeUnit, shortfall } from './lib/units.js';
@@ -11,6 +12,11 @@ const {
   PARTNER_LINKBACK_URL = 'http://localhost:3000',
   APP_API_TOKEN,
   TRUST_PROXY, // e.g. 1 when behind nginx, so rate limits see real client IPs
+  KROGER_CLIENT_ID,
+  KROGER_CLIENT_SECRET,
+  KROGER_REDIRECT_URI, // must exactly match a redirect URL registered on the Kroger app
+  KROGER_BASE_URL = 'https://api.kroger.com',
+  KROGER_TOKEN_FILE = './data/kroger-tokens.json',
   PANTRY_FILE = './data/pantry.json',
   PORT = 3000,
 } = process.env;
@@ -30,6 +36,17 @@ setInterval(() => {
 }, 60 * 60 * 1000).unref();
 
 const pantry = createPantry(PANTRY_FILE);
+
+const krogerEnabled = Boolean(KROGER_CLIENT_ID && KROGER_CLIENT_SECRET && KROGER_REDIRECT_URI);
+const kroger = krogerEnabled
+  ? createKroger({
+      clientId: KROGER_CLIENT_ID,
+      clientSecret: KROGER_CLIENT_SECRET,
+      redirectUri: KROGER_REDIRECT_URI,
+      baseUrl: KROGER_BASE_URL,
+      tokenFile: KROGER_TOKEN_FILE,
+    })
+  : null;
 
 const app = express();
 if (TRUST_PROXY) app.set('trust proxy', Number(TRUST_PROXY) || TRUST_PROXY);
@@ -62,6 +79,7 @@ const limiter = (max) => rateLimit({
 // spend Instacart calls get a tighter limit on top of the general one.
 app.use('/api', limiter(120), requireToken);
 app.use('/api/instacart', limiter(20));
+app.use('/api/kroger', limiter(30));
 
 // Posts payload to an Instacart IDP endpoint and responds with the page link,
 // serving a cached link when the same payload was sent before.
@@ -211,7 +229,7 @@ app.post('/api/instacart/shopping-list', (req, res) => {
 });
 
 // Lets clients hide the Instacart button until a key is configured.
-app.get('/api/config', (req, res) => res.json({ instacartEnabled: Boolean(INSTACART_API_KEY) }));
+app.get('/api/config', (req, res) => res.json({ instacartEnabled: Boolean(INSTACART_API_KEY), krogerEnabled }));
 
 const formatQuantity = ({ quantity, unit }) => {
   const q = Number(quantity);
@@ -232,6 +250,99 @@ app.post('/api/shopping-list/export', (req, res) => {
   const { needed, skipped } = subtractPantry(userId, normalizeItems(items), keep);
   const lines = needed.map((i) => `- [ ] ${formatQuantity(i)}${i.displayText ?? i.name}`);
   res.json({ needed, skipped, text: [`# ${title}`, ...lines].join('\n') });
+});
+
+// ---- Kroger (Public APIs): match ingredients to products and add them to the shopper's cart ----
+
+const requireKroger = (req, res, next) =>
+  kroger ? next() : res.status(503).json({ error: 'Kroger credentials are not configured' });
+
+const krogerError = (res, err) => {
+  if (err.status === 401 && !err.details) return res.status(401).json({ error: err.message, needsConnect: true });
+  console.error(err.message, err.details ?? '');
+  return res.status(502).json({ error: 'Kroger request failed', status: err.status, details: err.details });
+};
+
+// Kroger carts take whole product units, not recipe measurements, so a "2 cups"
+// ingredient becomes 1 product. Countable items ("3 each") use the count.
+const cartQuantity = ({ quantity, unit }) =>
+  Number(quantity) > 0 && normalizeUnit(unit) === 'each' ? Math.ceil(Number(quantity)) : 1;
+
+// Nearby Kroger-family stores. Body: { zipCode }
+app.post('/api/kroger/stores', requireKroger, async (req, res) => {
+  const { zipCode } = req.body ?? {};
+  if (!/^\d{5}$/.test(String(zipCode))) return res.status(400).json({ error: 'zipCode must be 5 digits' });
+  try {
+    res.json({ stores: await kroger.findStores(zipCode) });
+  } catch (err) {
+    krogerError(res, err);
+  }
+});
+
+// Starts the shopper's Kroger sign-in. Body: { userId }. Send the user to `url`.
+app.post('/api/kroger/connect', requireKroger, (req, res) => {
+  const { userId } = req.body ?? {};
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+  res.json({ url: kroger.startConnect(String(userId)) });
+});
+
+app.get('/api/kroger/status/:userId', requireKroger, async (req, res) => {
+  try {
+    res.json({ connected: await kroger.isConnected(req.params.userId) });
+  } catch (err) {
+    krogerError(res, err);
+  }
+});
+
+// Kroger redirects the shopper's browser here after they approve access, so it
+// can't carry our bearer token. The one-time `state` ties it to the request we started.
+app.get('/kroger/callback', requireKroger, async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error || !code || !state) return res.status(400).send('Kroger sign-in was cancelled or failed.');
+  try {
+    await kroger.finishConnect(String(code), String(state));
+    res.redirect(PARTNER_LINKBACK_URL);
+  } catch (err) {
+    console.error(err.message, err.details ?? '');
+    res.status(err.status === 400 ? 400 : 502).send('Could not complete Kroger sign-in. Please try again.');
+  }
+});
+
+// Matches ingredients to Kroger products at a store and adds them to the shopper's cart.
+// Body: { userId, locationId, modality?: 'PICKUP'|'DELIVERY', keep?: string[], preview?,
+//         items: [{ name, quantity?, unit?, upc? }] }
+// Pantry handling matches the other endpoints. With `preview: true` it only returns
+// the matches, so the app can show them before anything is added. Pass `upc` on an
+// item to skip the search (e.g. a product the user already picked).
+app.post('/api/kroger/cart', requireKroger, async (req, res) => {
+  const { userId, locationId, modality = 'PICKUP', keep, preview, items } = req.body ?? {};
+  if (!userId || !/^\d{8}$/.test(String(locationId))) {
+    return res.status(400).json({ error: 'userId and an 8-digit locationId are required' });
+  }
+  if (!['PICKUP', 'DELIVERY'].includes(modality)) return res.status(400).json({ error: 'modality must be PICKUP or DELIVERY' });
+  if (!Array.isArray(items) || items.length === 0 || items.length > 40 || !items.every(isValidItem)) {
+    return res.status(400).json({ error: 'items must be 1-40 entries of { name, quantity?, unit?, upc? }' });
+  }
+
+  try {
+    const { needed, skipped } = subtractPantry(userId, normalizeItems(items), keep);
+    const results = await Promise.all(
+      needed.map(async (item) => ({
+        item,
+        product: item.upc ? { upc: String(item.upc) } : await kroger.searchProduct(item.name, locationId),
+      })),
+    );
+    const matched = results
+      .filter((r) => r.product)
+      .map(({ item, product }) => ({ name: item.name, quantity: cartQuantity(item), ...product }));
+    const unmatched = results.filter((r) => !r.product).map((r) => r.item.name);
+
+    if (preview || matched.length === 0) return res.json({ matched, unmatched, skipped });
+    await kroger.addToCart(userId, matched, modality);
+    res.json({ added: matched, unmatched, skipped });
+  } catch (err) {
+    krogerError(res, err);
+  }
 });
 
 app.listen(PORT, () => console.log(`Seasonal Chef listening on :${PORT}`));
