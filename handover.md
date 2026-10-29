@@ -24,7 +24,7 @@ It is meant to be called by your own backend or trusted app, not directly by bro
 | Plain-text list export (Copy / Share / Print) | Built, tested in a browser. Works with no partner key |
 | Kroger (stores, sign-in, product match, add to cart) | Built against Kroger's published API specs, tested against a fake server only. Needs your client secret and a real shopper sign-in to verify |
 | Zinc / Walmart | **Not built.** Research only, see below |
-| Tests | No automated test suite yet. All checks were manual `curl` runs against fake servers (scripts were in a scratch folder and are not in the repo) |
+| Tests | `npm test` (20 tests, Node's built-in runner): Kroger client (token refresh race, timeouts, cart), cart matching (concurrency, partial failure, duplicates) and the cart route end to end, all against a fake Kroger server in `test/`. Pantry math, name cleanup, auth and rate limits are **not** covered yet |
 
 ## Run it locally
 
@@ -94,9 +94,15 @@ Shared pantry options on the Instacart, export and Kroger-cart endpoints: `userI
 2. Add a Kroger store picker and "Add to Kroger cart" button to the front end (the demo page has none yet), showing the `preview` matches before adding.
 3. Email Instacart (see above) and recheck their developer page periodically. When a key arrives, set `INSTACART_API_KEY` and run a dev-server test order with 2 cups milk and 100 g flour.
 4. Replace the demo front end with your real app, and have your backend (not the browser) hold `APP_API_TOKEN`.
-5. Add automated tests (pantry math, name cleanup, auth, rate limits).
+5. Extend the automated tests to pantry math, name cleanup, auth and rate limits (the Kroger client and cart route are covered; see `test/`).
 6. If you deploy to the VPS: set `TRUST_PROXY=1`, keep `data/` out of git, and back up the pantry and token files.
 7. Open a pull request for this branch when you are ready to merge into `main`.
+
+## Kroger fixes after review (branch `fix/kroger-cart-reliability`)
+
+Fixed and tested: concurrent token refresh no longer signs a shopper out (one shared refresh per user); one failed product lookup no longer loses the cart (`failed` is reported, at most 5 lookups at once, all-failed is a 502); every Kroger call has a 10 s timeout; duplicate UPCs merge into one line; tokens are kept in a `Map`.
+
+Still open from the review: matching takes the first in-stock result (rank results and let the shopper swap a match); the sign-in `state` is not bound to the browser that started it (add a short-lived cookie); non-`each` items always add quantity 1 (show this in the preview). None of it has run against the real Kroger service yet.
 
 ## Gotchas from this session
 

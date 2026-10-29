@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
+import { matchItems, summarize } from './lib/cart.js';
 import { createKroger } from './lib/kroger.js';
 import { cleanName, mergeDuplicates } from './lib/names.js';
 import { createPantry } from './lib/pantry.js';
@@ -326,20 +327,13 @@ app.post('/api/kroger/cart', requireKroger, async (req, res) => {
 
   try {
     const { needed, skipped } = subtractPantry(userId, normalizeItems(items), keep);
-    const results = await Promise.all(
-      needed.map(async (item) => ({
-        item,
-        product: item.upc ? { upc: String(item.upc) } : await kroger.searchProduct(item.name, locationId),
-      })),
-    );
-    const matched = results
-      .filter((r) => r.product)
-      .map(({ item, product }) => ({ name: item.name, quantity: cartQuantity(item), ...product }));
-    const unmatched = results.filter((r) => !r.product).map((r) => r.item.name);
+    const results = await matchItems(needed, (item) => kroger.searchProduct(item.name, locationId));
+    // `failed` = lookups that errored (timeout, rate limit): worth retrying, unlike `unmatched`.
+    const { matched, unmatched, failed } = summarize(results, cartQuantity);
 
-    if (preview || matched.length === 0) return res.json({ matched, unmatched, skipped });
+    if (preview || matched.length === 0) return res.json({ matched, unmatched, failed, skipped });
     await kroger.addToCart(userId, matched, modality);
-    res.json({ added: matched, unmatched, skipped });
+    res.json({ added: matched, unmatched, failed, skipped });
   } catch (err) {
     krogerError(res, err);
   }

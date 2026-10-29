@@ -38,7 +38,16 @@ and `KROGER_REDIRECT_URI` (must match a redirect URL registered on the Kroger ap
    `GET /api/kroger/status/:userId` says whether they're connected.
 3. `POST /api/kroger/cart` `{ userId, locationId, modality?, keep?, preview?, items }` subtracts the pantry, matches each
    ingredient to an in-stock product at that store, and adds them to the shopper's cart. Use `preview: true` to see matches first.
-   Checkout happens in Kroger's app or site.
+   Checkout happens in Kroger's app or site. The response lists `added` (or `matched` in preview), `unmatched` (no
+   in-stock product found), `failed` (the lookup itself errored, worth retrying) and `skipped` (already in the pantry).
+   Two ingredients that match one product become one cart line with the quantities added. Lookups run at most 5 at a time.
+   If every lookup fails the route answers 502 rather than reporting an empty match.
 
 Kroger carts hold whole product units, so "2 cups milk" becomes 1 milk; only `each` quantities use the count.
-Matching is a text search, so show the `preview` to the user. Public API limits: 10,000 product, 1,600 location and 5,000 cart calls per day.
+Matching is a text search (first in-stock result), so show the `preview` to the user.
+Every Kroger call times out after 10 seconds (`504`; `502` if unreachable).
+
+## Tests
+
+`npm test` runs the suite (Node's built-in runner, no extra dependencies). It talks to a fake Kroger server in
+`test/fake-kroger.js`, so it needs no credentials and never touches the real service. Public API limits: 10,000 product, 1,600 location and 5,000 cart calls per day.
