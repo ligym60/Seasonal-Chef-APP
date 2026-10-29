@@ -11,11 +11,12 @@ const {
   PORT = 3000,
 } = process.env;
 
-// Links expire after LINK_EXPIRES_IN_DAYS (recipes default to 30, shopping lists
-// have no default so we set it). Reuse them until shortly before that, and only
-// regenerate when the content changes.
-const LINK_EXPIRES_IN_DAYS = 30;
-const CACHE_TTL_MS = (LINK_EXPIRES_IN_DAYS - 1) * 24 * 60 * 60 * 1000;
+// Instacart's guidance: pages tailored to one user are short-lived (under 14
+// days); pages for a static recipe live longer (over 31 days) and get reused.
+// Cached links are dropped a day before they expire.
+const CUSTOM_EXPIRES_IN_DAYS = 14;
+const STATIC_EXPIRES_IN_DAYS = 60;
+const DAY_MS = 24 * 60 * 60 * 1000;
 const urlCache = new Map(); // endpoint + payload hash -> { url, expiresAt }
 
 // Drop expired entries so the cache doesn't grow forever.
@@ -60,23 +61,28 @@ async function respondWithLink(res, path, payload, skipped = []) {
     if (!data.products_link_url) {
       return res.status(502).json({ error: 'Instacart returned no link', details: data });
     }
-    urlCache.set(cacheKey, { url: data.products_link_url, expiresAt: Date.now() + CACHE_TTL_MS });
+    urlCache.set(cacheKey, { url: data.products_link_url, expiresAt: Date.now() + (payload.expires_in - 1) * DAY_MS });
     res.json({ url: data.products_link_url, skipped });
   } catch (err) {
     res.status(502).json({ error: 'Could not reach Instacart', details: String(err) });
   }
 }
 
+const expiresInDays = (userId) => (userId ? CUSTOM_EXPIRES_IN_DAYS : STATIC_EXPIRES_IN_DAYS);
+
 const isValidItem = (i) => i && typeof i.name === 'string' && i.name.trim() !== '';
 
 // Subtracts what the user already has from what the recipe/list needs.
 // Items with no quantity can't be compared, so they are always kept.
-function subtractPantry(userId, items) {
+// Names in `keep` are always included in full, which lets a user put back
+// something the pantry said they already have.
+function subtractPantry(userId, items, keep = []) {
+  const kept = new Set(keep.map((n) => String(n).trim().toLowerCase()));
   const needed = [];
   const skipped = [];
   for (const item of items) {
     const quantity = Number(item.quantity);
-    if (!userId || !(quantity > 0)) {
+    if (!userId || !(quantity > 0) || kept.has(item.name.trim().toLowerCase())) {
       needed.push(item);
       continue;
     }
@@ -89,14 +95,14 @@ function subtractPantry(userId, items) {
 }
 
 // Turns an item into the fields Instacart expects; `measurementsKey` differs
-// between the recipe and shopping-list endpoints.
-function toLineItem({ name, quantity, unit }, measurementsKey) {
+// between the recipe and shopping-list endpoints. `name` is used for matching,
+// so keep it generic; `displayText` is only for preparation notes ("diced onion").
+function toLineItem({ name, quantity, unit, displayText }, measurementsKey) {
   const q = Number(quantity);
-  const hasQuantity = q > 0;
   return {
     name,
-    display_text: [hasQuantity && q, hasQuantity && unit, name].filter(Boolean).join(' '),
-    ...(hasQuantity && { [measurementsKey]: measurementsFor({ quantity: q, unit }) }),
+    ...(displayText && { display_text: displayText }),
+    ...(q > 0 && { [measurementsKey]: measurementsFor({ quantity: q, unit }) }),
   };
 }
 
@@ -117,22 +123,26 @@ app.delete('/api/pantry/:userId/:name', (req, res) => {
 });
 
 // Builds an Instacart recipe page for a recipe and returns its link.
-// Body: { userId?, title, servings?, imageUrl?, instructions?: string[],
-//         ingredients: [{ name, quantity?, unit? }] }
-// With a userId, ingredients already in that user's pantry are left out.
+// Body: { userId?, keep?: string[], preview?, title, servings?, imageUrl?,
+//         instructions?: string[], ingredients: [{ name, quantity?, unit?, displayText? }] }
+// With a userId, ingredients already in that user's pantry are left out, except
+// names in `keep`. With `preview: true`, returns { needed, skipped } and does
+// not call Instacart, so the app can let the user put items back first.
 app.post('/api/instacart/recipe', (req, res) => {
-  const { userId, title, servings, imageUrl, instructions, ingredients } = req.body ?? {};
+  const { userId, keep, preview, title, servings, imageUrl, instructions, ingredients } = req.body ?? {};
   if (!title || !Array.isArray(ingredients) || ingredients.length === 0 || !ingredients.every(isValidItem)) {
     return res.status(400).json({ error: 'title and ingredients ({ name, quantity?, unit? }) are required' });
   }
 
-  const { needed, skipped } = subtractPantry(userId, ingredients);
+  const { needed, skipped } = subtractPantry(userId, ingredients, keep);
+  if (preview) return res.json({ needed, skipped });
   if (needed.length === 0) return res.json({ url: null, skipped });
 
   respondWithLink(res, '/idp/v1/products/recipe', {
     title,
     servings,
     image_url: imageUrl,
+    expires_in: expiresInDays(userId),
     instructions,
     ingredients: needed.map((item) => toLineItem(item, 'measurements')),
     landing_page_configuration: { partner_linkback_url: PARTNER_LINKBACK_URL, enable_pantry_items: true },
@@ -140,22 +150,24 @@ app.post('/api/instacart/recipe', (req, res) => {
 });
 
 // Builds an Instacart shopping list page (e.g. a whole meal-plan cart) and returns its link.
-// Body: { userId?, title?, imageUrl?, items: [{ name, quantity?, unit? }] }
-// With a userId, items already in that user's pantry are left out.
+// Body: { userId?, keep?: string[], preview?, title?, imageUrl?,
+//         items: [{ name, quantity?, unit?, displayText? }] }
+// Pantry handling (userId, keep, preview) works as on the recipe endpoint.
 app.post('/api/instacart/shopping-list', (req, res) => {
-  const { userId, title = 'Seasonal Chef shopping list', imageUrl, items } = req.body ?? {};
+  const { userId, keep, preview, title = 'Seasonal Chef shopping list', imageUrl, items } = req.body ?? {};
   if (!Array.isArray(items) || items.length === 0 || !items.every(isValidItem)) {
     return res.status(400).json({ error: 'items must be a non-empty array of { name, quantity?, unit? }' });
   }
 
-  const { needed, skipped } = subtractPantry(userId, items);
+  const { needed, skipped } = subtractPantry(userId, items, keep);
+  if (preview) return res.json({ needed, skipped });
   if (needed.length === 0) return res.json({ url: null, skipped });
 
   respondWithLink(res, '/idp/v1/products/products_link', {
     title,
     image_url: imageUrl,
     link_type: 'shopping_list',
-    expires_in: LINK_EXPIRES_IN_DAYS,
+    expires_in: expiresInDays(userId),
     line_items: needed.map((item) => toLineItem(item, 'line_item_measurements')),
     landing_page_configuration: { partner_linkback_url: PARTNER_LINKBACK_URL },
   }, skipped);
