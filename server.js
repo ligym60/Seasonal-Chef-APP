@@ -1,5 +1,7 @@
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import express from 'express';
+import rateLimit from 'express-rate-limit';
+import { cleanName, mergeDuplicates } from './lib/names.js';
 import { createPantry } from './lib/pantry.js';
 import { measurementsFor, normalizeUnit, shortfall } from './lib/units.js';
 
@@ -7,6 +9,8 @@ const {
   INSTACART_API_KEY,
   INSTACART_BASE_URL = 'https://connect.dev.instacart.tools',
   PARTNER_LINKBACK_URL = 'http://localhost:3000',
+  APP_API_TOKEN,
+  TRUST_PROXY, // e.g. 1 when behind nginx, so rate limits see real client IPs
   PANTRY_FILE = './data/pantry.json',
   PORT = 3000,
 } = process.env;
@@ -28,8 +32,36 @@ setInterval(() => {
 const pantry = createPantry(PANTRY_FILE);
 
 const app = express();
-app.use(express.json());
+if (TRUST_PROXY) app.set('trust proxy', Number(TRUST_PROXY) || TRUST_PROXY);
+app.use(express.json({ limit: '100kb' }));
 app.use(express.static('public'));
+
+// Every /api route needs `Authorization: Bearer <APP_API_TOKEN>`. This service
+// is meant to be called by your own backend or trusted app, which is
+// responsible for deciding who a `userId` is. With no token set it refuses
+// everything rather than running open.
+function requireToken(req, res, next) {
+  if (!APP_API_TOKEN) return res.status(503).json({ error: 'APP_API_TOKEN is not configured' });
+  const given = Buffer.from(req.get('authorization')?.replace(/^Bearer /i, '') ?? '');
+  const expected = Buffer.from(APP_API_TOKEN);
+  if (given.length !== expected.length || !timingSafeEqual(given, expected)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+const limiter = (max) => rateLimit({
+  windowMs: 60 * 1000,
+  limit: max,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, slow down' },
+});
+
+// Rate limit before auth so bad-token guessing is throttled too. Routes that
+// spend Instacart calls get a tighter limit on top of the general one.
+app.use('/api', limiter(120), requireToken);
+app.use('/api/instacart', limiter(20));
 
 // Posts payload to an Instacart IDP endpoint and responds with the page link,
 // serving a cached link when the same payload was sent before.
@@ -69,6 +101,10 @@ async function respondWithLink(res, path, payload, skipped = []) {
 }
 
 const expiresInDays = (userId) => (userId ? CUSTOM_EXPIRES_IN_DAYS : STATIC_EXPIRES_IN_DAYS);
+
+// Cleans names for Instacart matching and the pantry lookup, and merges repeats.
+const normalizeItems = (items) =>
+  mergeDuplicates(items.map(({ name, displayText, ...rest }) => ({ ...rest, ...cleanName(name, displayText) })));
 
 const isValidItem = (i) => i && typeof i.name === 'string' && i.name.trim() !== '';
 
@@ -113,12 +149,13 @@ app.get('/api/pantry/:userId', (req, res) => res.json(pantry.list(req.params.use
 app.put('/api/pantry/:userId/:name', (req, res) => {
   const { quantity, unit } = req.body ?? {};
   if (!(Number(quantity) >= 0)) return res.status(400).json({ error: 'quantity must be a number >= 0' });
-  pantry.set(req.params.userId, req.params.name, quantity, unit);
-  res.json(pantry.get(req.params.userId, req.params.name));
+  const { name } = cleanName(req.params.name);
+  pantry.set(req.params.userId, name, quantity, unit);
+  res.json(pantry.get(req.params.userId, name));
 });
 
 app.delete('/api/pantry/:userId/:name', (req, res) => {
-  pantry.remove(req.params.userId, req.params.name);
+  pantry.remove(req.params.userId, cleanName(req.params.name).name);
   res.status(204).end();
 });
 
@@ -134,7 +171,7 @@ app.post('/api/instacart/recipe', (req, res) => {
     return res.status(400).json({ error: 'title and ingredients ({ name, quantity?, unit? }) are required' });
   }
 
-  const { needed, skipped } = subtractPantry(userId, ingredients, keep);
+  const { needed, skipped } = subtractPantry(userId, normalizeItems(ingredients), keep);
   if (preview) return res.json({ needed, skipped });
   if (needed.length === 0) return res.json({ url: null, skipped });
 
@@ -159,7 +196,7 @@ app.post('/api/instacart/shopping-list', (req, res) => {
     return res.status(400).json({ error: 'items must be a non-empty array of { name, quantity?, unit? }' });
   }
 
-  const { needed, skipped } = subtractPantry(userId, items, keep);
+  const { needed, skipped } = subtractPantry(userId, normalizeItems(items), keep);
   if (preview) return res.json({ needed, skipped });
   if (needed.length === 0) return res.json({ url: null, skipped });
 

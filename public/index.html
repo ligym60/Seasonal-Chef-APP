@@ -26,6 +26,9 @@
         { name: 'vegetable broth', quantity: 4, unit: 'cup' },
       ],
     };
+    // Demo only: a real app's backend holds the token and calls this service.
+    let token = sessionStorage.getItem('apiToken') || prompt('API token (APP_API_TOKEN)');
+    if (token) sessionStorage.setItem('apiToken', token);
     const btn = document.getElementById('get-ingredients');
     const status = document.getElementById('status');
     btn.addEventListener('click', async () => {
@@ -34,7 +37,7 @@
       try {
         const res = await fetch('/api/instacart/recipe', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify(recipe),
         });
         const data = await res.json();
